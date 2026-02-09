@@ -16,6 +16,10 @@ $(BIN_DIR):
 run: $(BIN)
 	./$(BIN)
 
+test:
+	@chmod +x stress_test.sh
+	@./stress_test.sh
+
 clean:
 	rm -f $(BIN)
 
