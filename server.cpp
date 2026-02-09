@@ -20,6 +20,18 @@ queue<int> task_queue;
 mutex queue_mutex;
 condition_variable queue_cv;
 
+void send_http_error(int client_fd, int code, const string& message){
+    string body = message+"\n";
+    string response = "HTTP/1.1 " + to_string(code) + " " + message + "\r\n" +
+                      "Content-Type: text/plain\r\n" +
+                      "Content-Length: " + to_string(body.size()) + "\r\n" +
+                      "Connection: close\r\n"
+                      "\r\n" +
+                      body;
+
+    send(client_fd, response.c_str(), response.size(), 0);
+}
+
 void set_socket_timeout(int fd, int seconds){
     timeval timeout{};
     timeout.tv_sec = seconds;
@@ -54,9 +66,9 @@ void worker_thread(){
         while(request.find("\r\n\r\n") == string::npos){ //until end of headers
             ssize_t bytes = recv(client_fd, buf, BUFFER_SIZE, 0);
             if(bytes <= 0){
-                cerr<<"Failed to receive data from client."<<endl;
+                send_http_error(client_fd, 400, "Failed to receive data from client.");
                 if(errno == EWOULDBLOCK || errno == EAGAIN){
-                    cerr<<"Client read timed out."<<endl;
+                    send_http_error(client_fd, 408, "Client read timed out.");
                 }
                 client_error=true;
                 break ;
@@ -71,10 +83,33 @@ void worker_thread(){
         
         cout<<"Request received: \n"<<request<<endl;
 
+        size_t line_end = request.find("\r\n");
+        string request_line = request.substr(0, line_end);
+        
+        size_t method_end = request_line.find(' ');
+        size_t url_end = request_line.find(' ', method_end + 1);
+
+        string method= request_line.substr(0, method_end);
+        string url = request_line.substr(method_end + 1, url_end - method_end -
+        1);
+        string version = request_line.substr(url_end + 1);
+
+
+        string path=url;
+
+        if(url.find("http://") == 0){
+            size_t path_pos = url.find('/', 7); // skip http://
+            path=(path_pos != string::npos) ? url.substr(path_pos) : "/";
+            
+        }
+
+        string new_request = method + " " + path + " " + version;
+        request.replace(0, line_end, new_request); //replace request line with modified one
+        
         //extract host header
         size_t host_pos = request.find("Host: ");
         if(host_pos == string::npos){
-            cerr<<"Host header not found in request."<<endl;
+            send_http_error(client_fd, 400, "Host header not found in request.");
             close(client_fd);
             continue ;
         }
@@ -82,8 +117,15 @@ void worker_thread(){
         //Extract host value
         size_t host_end = request.find("\r\n", host_pos);
 
-        string host = request.substr(host_pos + 6, host_end - (host_pos + 6));
+        string host_port = request.substr(host_pos + 6, host_end - (host_pos + 6));
+        string host=host_port;
+        string port="80";
 
+        size_t colon_pos = host_port.find(':');
+        if(colon_pos != string::npos){
+            host = host_port.substr(0, colon_pos);
+            port = host_port.substr(colon_pos + 1);
+        }
         cout<<"Extracted Host: "<<host<<endl;
 
 
@@ -92,8 +134,8 @@ void worker_thread(){
         hints.ai_family = AF_INET;
         hints.ai_socktype = SOCK_STREAM;
 
-        if(getaddrinfo(host.c_str(), "80", &hints, &res) != 0){
-            cerr<<"Failed to resolve host: "<<host<<endl;
+        if(getaddrinfo(host.c_str(), port.c_str(), &hints, &res) != 0){
+            send_http_error(client_fd, 502, "Bad Gateway");
             close(client_fd);
             continue ;
         }
@@ -107,7 +149,7 @@ void worker_thread(){
         );
         set_socket_timeout(origin_fd, 5); //set 5 second timeout for origin socket
         if(connect(origin_fd,res->ai_addr,res->ai_addrlen) < 0){
-            cerr<<"Failed to connect to origin server: "<<host<<endl;
+            send_http_error(client_fd, 502, "Failed to connect to origin server: "+host);
             freeaddrinfo(res);
             close(client_fd);
             continue ;
@@ -141,7 +183,7 @@ void worker_thread(){
             ssize_t bytes = recv(origin_fd, buffer, BUFFER_SIZE, 0);
             if(bytes <= 0){
                 if(errno == EWOULDBLOCK || errno == EAGAIN){
-                    cerr<<"Origin server read timed out."<<endl;
+                    send_http_error(client_fd, 504, "Origin server read timed out.");
                 }
                 break; //end of response or error
             }
