@@ -3,10 +3,160 @@
 #include<arpa/inet.h>
 #include<unistd.h>
 #include<cstring>
+#include<thread>
+#include<queue>
+#include<mutex>
+#include<condition_variable>
+#include<vector>
+#include<errno.h>
 
 using namespace std;
 
 constexpr int BUFFER_SIZE = 4096;
+constexpr int PORT = 8080;
+constexpr int WORKER_COUNT = 4;
+
+queue<int> task_queue;
+mutex queue_mutex;
+condition_variable queue_cv;
+
+void set_socket_timeout(int fd, int seconds){
+    timeval timeout{};
+    timeout.tv_sec = seconds;
+    setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout));
+    setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &timeout, sizeof(timeout));
+}
+
+void worker_thread(){
+    while(true){
+        int client_fd;
+
+        // wait for work(until queue is not empty) and get client fd from queue
+        {
+            unique_lock<mutex> lock(queue_mutex);
+            queue_cv.wait(lock, []{ return !task_queue.empty(); });
+            client_fd = task_queue.front();
+            set_socket_timeout(client_fd, 5); //set 5 second timeout for client socket
+            task_queue.pop();
+        }
+
+        // handle client
+        //Receive request from client
+
+        char buffer[BUFFER_SIZE];
+
+        cout<<"Handling client in thread [THREAD_ID]:["<<this_thread::get_id()<<"]"<<endl;
+
+        string request;
+        char buf[BUFFER_SIZE];
+
+        bool client_error=false;
+        while(request.find("\r\n\r\n") == string::npos){ //until end of headers
+            ssize_t bytes = recv(client_fd, buf, BUFFER_SIZE, 0);
+            if(bytes <= 0){
+                cerr<<"Failed to receive data from client."<<endl;
+                if(errno == EWOULDBLOCK || errno == EAGAIN){
+                    cerr<<"Client read timed out."<<endl;
+                }
+                client_error=true;
+                break ;
+            }
+            request.append(buf, bytes);
+        }
+
+        if(client_error){
+            close(client_fd);
+            continue ;
+        }
+        
+        cout<<"Request received: \n"<<request<<endl;
+
+        //extract host header
+        size_t host_pos = request.find("Host: ");
+        if(host_pos == string::npos){
+            cerr<<"Host header not found in request."<<endl;
+            close(client_fd);
+            continue ;
+        }
+
+        //Extract host value
+        size_t host_end = request.find("\r\n", host_pos);
+
+        string host = request.substr(host_pos + 6, host_end - (host_pos + 6));
+
+        cout<<"Extracted Host: "<<host<<endl;
+
+
+        //Resolve host
+        addrinfo hints{}, *res;
+        hints.ai_family = AF_INET;
+        hints.ai_socktype = SOCK_STREAM;
+
+        if(getaddrinfo(host.c_str(), "80", &hints, &res) != 0){
+            cerr<<"Failed to resolve host: "<<host<<endl;
+            close(client_fd);
+            continue ;
+        }
+
+
+        //Create socket and connect to origin server
+        int origin_fd = socket(
+            res->ai_family, 
+            res->ai_socktype, 
+            res->ai_protocol
+        );
+        set_socket_timeout(origin_fd, 5); //set 5 second timeout for origin socket
+        if(connect(origin_fd,res->ai_addr,res->ai_addrlen) < 0){
+            cerr<<"Failed to connect to origin server: "<<host<<endl;
+            freeaddrinfo(res);
+            close(client_fd);
+            continue ;
+        }
+
+        freeaddrinfo(res);
+
+        //Remove proxy header is present 
+        size_t proxy_pos = request.find("Proxy-Connection: ");
+        if(proxy_pos != string::npos){
+            size_t proxy_end = request.find("\r\n", proxy_pos);
+            request.erase(proxy_pos, proxy_end - proxy_pos + 2); //remove line
+        }
+
+        //Force connection close to simplify proxy logic
+        size_t connection_pos = request.find("Connection: ");
+        if(connection_pos == string::npos){
+            size_t header_end = request.find("\r\n\r\n");
+            request.insert(header_end, "\r\nConnection: close");
+        }
+
+        
+        //Forward request to origin server
+        send(origin_fd, request.c_str(), request.size(), 0);
+        
+        cout << "Forwarded request \n" << request <<endl;
+        
+        //Strean response back to client
+
+        while(true){
+            ssize_t bytes = recv(origin_fd, buffer, BUFFER_SIZE, 0);
+            if(bytes <= 0){
+                if(errno == EWOULDBLOCK || errno == EAGAIN){
+                    cerr<<"Origin server read timed out."<<endl;
+                }
+                break; //end of response or error
+            }
+            send(client_fd, buffer, bytes, 0);
+        }
+
+
+        //Cleanup
+        close(origin_fd);
+        close(client_fd);
+
+
+    }
+}
+
 
 int main(){
 
@@ -21,97 +171,39 @@ int main(){
     sockaddr_in addr{};;
     addr.sin_family = AF_INET;
     addr.sin_addr.s_addr = INADDR_ANY;  //accept from any ip
-    addr.sin_port = htons(8080);  //port 8080
+    addr.sin_port = htons(8080);        //port 8080
 
-    if(bind(server_fd, (sockaddr*)&addr, sizeof(addr))<0){
-        perror("Bind failed");
-        close(server_fd);
-        return -1;
+    bind(server_fd, (sockaddr*)&addr, sizeof(addr));
+    listen(server_fd, 50);
+
+    cout<<"Concurrent Proxy Server is listening on port 8080..."<<endl;
+
+
+    //Start worker threads
+    vector<thread> workers;
+    for(int i=0; i<WORKER_COUNT; ++i){
+        workers.emplace_back(worker_thread);
     }
 
-    // listening for connections
-    if(listen(server_fd, 5)<0){
-        perror("Listen failed");
-        close(server_fd);
-        return -1;
+
+    //Accept loop
+    while(true){
+        int client_fd = accept(server_fd, nullptr, nullptr);
+        if(client_fd < 0){
+            perror("accept failed");
+            continue;
+        }
+        {
+            //Add client fd to task queue
+            {
+                lock_guard<mutex> lock(queue_mutex);
+                task_queue.push(client_fd);
+            }
+            queue_cv.notify_one();
+        }
+
     }
-
-    cout<<"Proxy Server is listening on port 8080..."<<endl;
-
-    // accepting one connection
-    int client_fd = accept(server_fd, nullptr, nullptr);
-    if(client_fd < 0){
-        perror("Accept failed");
-        close(server_fd);
-        return -1;
-    }
-
-    cout<<"Client connected!"<<endl;
-
-    //Read request
-    char buffer[BUFFER_SIZE];
-    ssize_t bytes= recv(client_fd,buffer,BUFFER_SIZE,0);
-
-    if(bytes <= 0){
-        perror("recv failed");
-        close(client_fd);
-        close(server_fd);
-        return -1;
-    }
-
-    string request(buffer, bytes);
-
-    cout<<"Received "<<bytes<<" bytes from client."<<endl;
-    cout<<"Received received:\n "<<request<<"\n";
-
-    //extract host header
-    size_t host_pos = request.find("Host: ");
-    if(host_pos == string::npos){
-        cerr<<"Host header not found in request."<<endl;
-        close(client_fd);
-        close(server_fd);
-        return 1;
-    }
-
-    size_t host_end = request.find("\r\n", host_pos);
-    string host = request.substr(host_pos + 6, host_end - (host_pos + 6));
-
-    cout<<"Extracted Host: "<<host<<endl;
-
-
-    //Resolve and connect to origin server
-
-    addrinfo hints{}, *res;
-    hints.ai_family = AF_INET;
-    hints.ai_socktype = SOCK_STREAM;
-
-    if(getaddrinfo(host.c_str(), "80", &hints, &res) != 0){
-        perror("getaddrinfo failed");
-        return 1;
-    }
-
-    int origin_fd = socket(res->ai_family, res->ai_socktype, res->ai_protocol);
-    if(connect(origin_fd,res->ai_addr,res->ai_addrlen) < 0){
-        perror("connect to origin server failed");
-        freeaddrinfo(res);
-        return 1;
-    }
-
-    freeaddrinfo(res);
-
-    //Forward request to origin server
-    send(origin_fd, request.c_str(), request.size(), 0);
-
-    while((bytes=recv(origin_fd, buffer, BUFFER_SIZE, 0)) > 0){
-        send(client_fd, buffer, bytes, 0);
-    }
-       
-    //cleanups
-    close(origin_fd);
-    close(client_fd);
     close(server_fd);
-
-    cout<<"Request completed."<<endl;
     return 0;
     
 }
