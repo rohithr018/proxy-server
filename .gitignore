@@ -1,0 +1,15 @@
+# Build artifacts
+bin/
+
+# Object files (future-proof)
+*.o
+
+# Editor / OS noise
+.vscode/
+.idea/
+*.swp
+*~
+.DS_Store
+
+# Logs (future phases)
+*.log
