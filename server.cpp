@@ -13,7 +13,10 @@
 using namespace std;
 
 constexpr int BUFFER_SIZE = 4096;
-constexpr int PORT = 8080;
+
+const char* port_env = std::getenv("PORT");
+int PORT = port_env ? std::stoi(port_env) : 8080;
+
 constexpr int WORKER_COUNT = 4;
 
 queue<int> task_queue;
@@ -218,7 +221,7 @@ int main(){
     bind(server_fd, (sockaddr*)&addr, sizeof(addr));
     listen(server_fd, 50);
 
-    cout<<"Concurrent Proxy Server is listening on port 8080..."<<endl;
+    cout<<"Proxy Server is listening on the port:"<< PORT <<endl;
 
 
     //Start worker threads
